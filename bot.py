@@ -103,15 +103,15 @@ async def send():
         photo=result["image"],
         caption=caption
     )
-    async def monitor():
+
+
+async def monitor():
     await bot.send_message(
         chat_id=GROUP_ID,
         text="🚀 Speedtest Bot Started Successfully."
     )
-    )
 
     while True:
-
         try:
             await send()
             logging.info("Speedtest sent successfully")
