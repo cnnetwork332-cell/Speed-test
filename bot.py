@@ -104,10 +104,10 @@ async def send():
         caption=caption
     )
     async def monitor():
-
     await bot.send_message(
         chat_id=GROUP_ID,
         text="🚀 Speedtest Bot Started Successfully."
+    )
     )
 
     while True:
