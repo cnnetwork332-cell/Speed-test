@@ -119,18 +119,9 @@ async def send():
         photo=result["image"],
         caption=caption
     )
-    async def monitor():
-
-    try:
-        await bot.send_photo(
-        chat_id=GROUP_ID,
-        photo=result["image"],
-        caption=caption
-    )
 
 
 async def monitor():
-
     try:
         await bot.send_message(
             chat_id=GROUP_ID,
