@@ -74,8 +74,8 @@ def run_speedtest():
         }
 
     except Exception as e:
-    logging.exception(e)
-    return None
+        logging.exception(e)
+        return None
 
 
 async def send():
