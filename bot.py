@@ -34,7 +34,9 @@ def mbps(bits):
 
 def mb(byte):
     return round(byte / 1024 / 1024, 2)
-    def run_speedtest():
+
+
+def run_speedtest():
     try:
         st = speedtest.Speedtest()
 
@@ -72,9 +74,11 @@ def mb(byte):
         }
 
     except Exception as e:
-        logging.exception(e)
-        return None
-        async def send():
+    logging.exception(e)
+    return None
+
+
+async def send():
 
     result = run_speedtest()
 
@@ -116,6 +120,16 @@ def mb(byte):
         caption=caption
     )
     async def monitor():
+
+    try:
+        await bot.send_photo(
+        chat_id=GROUP_ID,
+        photo=result["image"],
+        caption=caption
+    )
+
+
+async def monitor():
 
     try:
         await bot.send_message(
