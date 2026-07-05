@@ -13,7 +13,7 @@ logging.basicConfig(
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
-INTERVAL = int(os.getenv("INTERVAL", "20"))
+INTERVAL = int(os.getenv("INTERVAL", "3"))
 
 request = HTTPXRequest(
     connect_timeout=30,
