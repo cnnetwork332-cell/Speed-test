@@ -1,4 +1,5 @@
 import os
+import html
 import asyncio
 import logging
 import sqlite3
@@ -49,6 +50,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("speedtest-bot")
+# HTTP client INFO logs include Telegram API URLs (which contain the bot token).
+# Keep those logs quiet to avoid leaking credentials into deployment logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # speedtest-cli is blocking; use one worker and one test at a time.
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speedtest")
@@ -187,52 +192,81 @@ def fmt(value, digits=2):
 
 
 def format_result(r, include_alert=True):
-    # Use UTC explicitly so the timestamp is unambiguous.
+    """Return a premium, Telegram-HTML formatted speed-test report."""
     try:
-        dt = datetime.fromisoformat(r["timestamp"])
-        time_text = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-    except (ValueError, TypeError):
-        time_text = str(r["timestamp"])
+        dt = datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        time_text = dt.strftime("%d %b %Y • %H:%M:%S UTC")
+    except (ValueError, TypeError, AttributeError):
+        time_text = html.escape(str(r.get("timestamp", "Unknown")))
+
+    download = float(r.get("download_mbps") or 0)
+    upload = float(r.get("upload_mbps") or 0)
+    ping = float(r.get("ping_ms") or 0)
+    if download >= 100 and ping <= 25:
+        verdict, icon = "EXCELLENT", "🟢"
+    elif download >= 50 and ping <= 50:
+        verdict, icon = "VERY GOOD", "🔵"
+    elif download >= 25 and ping <= 80:
+        verdict, icon = "GOOD", "🟡"
+    elif download >= 5:
+        verdict, icon = "FAIR", "🟠"
+    else:
+        verdict, icon = "NEEDS ATTENTION", "🔴"
+
+    def esc(value, fallback="Unknown"):
+        return html.escape(str(value if value not in (None, "") else fallback))
 
     lines = [
-        "🚀 SPEEDTEST REPORT",
+        "<b>━━━━━━━━━━━━━━━━━━━━</b>",
+        "<b>🚀  SPEEDTEST  /  PERFORMANCE REPORT</b>",
+        "<b>━━━━━━━━━━━━━━━━━━━━</b>",
+        f"{icon} <b>CONNECTION QUALITY: {verdict}</b>",
         "",
-        f"⬇️ Download: {r['download_mbps']:.2f} Mbps",
-        f"⬆️ Upload: {r['upload_mbps']:.2f} Mbps",
-        f"🏓 Ping: {r['ping_ms']:.2f} ms",
-        f"🕒 Time: {time_text}",
-        f"📤 Test data sent: {r['bytes_sent_mb']:.2f} MB",
-        f"📥 Test data received: {r['bytes_received_mb']:.2f} MB",
+        "<b>⚡ SPEED METRICS</b>",
+        f"⬇️  <b>Download</b>   <code>{download:,.2f} Mbps</code>",
+        f"⬆️  <b>Upload</b>       <code>{upload:,.2f} Mbps</code>",
+        f"🏓  <b>Ping</b>          <code>{ping:,.2f} ms</code>",
         "",
-        "🌐 SERVER",
-        f"Name: {r['server_name']}",
-        f"Country: {r['server_country']}",
-        f"Sponsor: {r['server_sponsor']}",
+        "<b>🌐 NETWORK PROVIDER</b>",
+        f"🏢  <b>ISP</b>       {esc(r.get('isp'))}",
+        f"📍  <b>Country</b>   {esc(r.get('client_country'))}",
         "",
-        "👤 CONNECTION",
-        f"ISP: {r['isp']}",
-        f"Country: {r['client_country']}",
+        "<b>🖥️ TEST SERVER</b>",
+        f"📡  <b>Name</b>      {esc(r.get('server_name'))}",
+        f"🌍  <b>Country</b>   {esc(r.get('server_country'))}",
+        f"🤝  <b>Sponsor</b>   {esc(r.get('server_sponsor'))}",
+        "",
+        "<b>📦 TEST DATA</b>",
+        f"⬆️  <b>Sent</b>       <code>{float(r.get('bytes_sent_mb') or 0):,.2f} MB</code>",
+        f"⬇️  <b>Received</b>   <code>{float(r.get('bytes_received_mb') or 0):,.2f} MB</code>",
+        "",
+        "<b>🕒 TEST TIMESTAMP</b>",
+        f"<code>{time_text}</code>",
     ]
-
     if SHOW_CLIENT_IP:
-        lines.append(f"IP: {r['client_ip']}")
-
+        lines += [f"🌐 <b>Public IP</b>  <code>{esc(r.get('client_ip'))}</code>"]
     if SHOW_COORDINATES:
         lines += [
-            f"Server coordinates: {r.get('server_lat')}, {r.get('server_lon')}",
-            f"Client coordinates: {r.get('client_lat')}, {r.get('client_lon')}",
+            "", "<b>📍 COORDINATES</b>",
+            f"Server: <code>{esc(r.get('server_lat'))}, {esc(r.get('server_lon'))}</code>",
+            f"Client: <code>{esc(r.get('client_lat'))}, {esc(r.get('client_lon'))}</code>",
         ]
 
-    if include_alert:
-        alerts = []
-        if MIN_DOWNLOAD_MBPS > 0 and r["download_mbps"] < MIN_DOWNLOAD_MBPS:
-            alerts.append(f"⚠️ Download below {MIN_DOWNLOAD_MBPS:g} Mbps threshold")
-        if MIN_UPLOAD_MBPS > 0 and r["upload_mbps"] < MIN_UPLOAD_MBPS:
-            alerts.append(f"⚠️ Upload below {MIN_UPLOAD_MBPS:g} Mbps threshold")
-        if alerts:
-            lines += ["", *alerts]
+    alerts = []
+    if include_alert and MIN_DOWNLOAD_MBPS > 0 and download < MIN_DOWNLOAD_MBPS:
+        alerts.append(f"Download is below the configured target of {MIN_DOWNLOAD_MBPS:g} Mbps.")
+    if include_alert and MIN_UPLOAD_MBPS > 0 and upload < MIN_UPLOAD_MBPS:
+        alerts.append(f"Upload is below the configured target of {MIN_UPLOAD_MBPS:g} Mbps.")
+    if alerts:
+        lines += ["", "<b>⚠️ PERFORMANCE ALERT</b>"]
+        lines += [f"• {html.escape(item)}" for item in alerts]
 
-    lines += ["", "Powered by Speedtest Bot"]
+    if r.get("share_url"):
+        lines += ["", f'🔗 <a href="{html.escape(str(r["share_url"]), quote=True)}">View Speedtest share result</a>']
+    lines += ["", "<i>Automated network monitoring • Powered by Speedtest Bot</i>", "<b>━━━━━━━━━━━━━━━━━━━━</b>"]
     return "\n".join(lines)
 
 
@@ -260,23 +294,28 @@ async def safe_send(context, chat_id, text):
 
 
 async def post_result(context, result):
+    """Publish the full report as formatted text; avoids flaky remote image uploads."""
     caption = format_result(result)
-    share_url = result.get("share_url")
-
-    # speedtest-cli's share image is hosted externally and may be unavailable.
-    # If it fails to send, fall back to a text report.
-    if share_url:
-        try:
-            await context.bot.send_photo(
-                chat_id=GROUP_ID,
-                photo=share_url,
-                caption=caption[:1024],
-            )
-            return
-        except TelegramError:
-            log.warning("Share image failed to send; falling back to text")
-
-    await safe_send(context, GROUP_ID, caption)
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=caption,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except RetryAfter as exc:
+        delay = getattr(exc, "retry_after", 5)
+        if hasattr(delay, "total_seconds"):
+            delay = delay.total_seconds()
+        await asyncio.sleep(float(delay) + 1)
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=caption,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except TelegramError:
+        log.exception("Could not publish speed-test report; verify GROUP_ID and bot permissions")
 
 
 # ========================= ACCESS CONTROL ========================
@@ -334,19 +373,26 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
 # ========================= COMMANDS ==============================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🚀 Speedtest Bot is online!\n\n"
-        "Commands:\n"
-        "/speedtest - Run a test now\n"
-        "/status - Monitoring status and latest result\n"
-        "/stats - Historical statistics\n"
-        "/history - Recent tests\n"
-        "/monitor_on - Resume automatic tests\n"
-        "/monitor_off - Pause automatic tests\n"
-        "/setinterval 1800 - Change interval in seconds\n"
-        "/help - Show commands\n\n"
-        "Speed units: Mbps. Test interval is at least 60 seconds."
+    text = (
+        "<b>🚀 SPEEDTEST MONITOR</b>\n"
+        "<i>Your network. Measured, tracked, monitored.</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>📊 TEST & REPORTS</b>\n"
+        "<code>/speedtest</code>  Run a live speed test\n"
+        "<code>/status</code>      Monitor status + latest result\n"
+        "<code>/stats</code>       Lifetime performance summary\n"
+        "<code>/history</code>     Recent test history\n\n"
+        "<b>⚙️ MONITOR CONTROLS</b>\n"
+        "<code>/monitor_on</code>  Resume scheduled tests\n"
+        "<code>/monitor_off</code> Pause scheduled tests\n"
+        "<code>/setinterval 1800</code> Change interval in seconds\n\n"
+        "<b>💡 QUICK NOTES</b>\n"
+        "• Minimum interval: 60 seconds\n"
+        "• Speeds are shown in Mbps\n"
+        "• Reports are saved to the local history database\n\n"
+        "<i>Built for reliable network monitoring.</i>"
     )
+    await update.effective_message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -356,14 +402,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def speedtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.effective_message.reply_text(
-        "⏳ Running speed test. This can take a little while..."
+        "⏳ <b>Running speed test…</b>\n<i>Measuring download, upload and latency. This may take a little while.</i>",
+        parse_mode="HTML"
     )
     try:
         result, error = await perform_test(context, notify_group=False)
         if error:
             await msg.edit_text(f"⚠️ {error}")
             return
-        await msg.edit_text(format_result(result))
+        await msg.edit_text(format_result(result), parse_mode="HTML", disable_web_page_preview=True)
         # Also publish the result in the configured group if command was elsewhere.
         if update.effective_chat and update.effective_chat.id != GROUP_ID:
             await post_result(context, result)
@@ -372,29 +419,35 @@ async def speedtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     except Exception as exc:
         log.exception("Manual speed test failed")
-        await msg.edit_text(f"❌ Speed test failed: {str(exc)[:500]}")
+        await msg.edit_text(f"❌ <b>Speed test failed</b>\n<code>{html.escape(str(exc)[:400])}</code>", parse_mode="HTML")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app = context.application
     paused = app.bot_data.get("monitor_paused", False)
     latest = await asyncio.to_thread(read_latest)
-    state = "⏸ Paused" if paused else "🟢 Running"
-    text = (
-        f"📡 MONITOR STATUS\n"
-        f"Automatic monitoring: {state}\n"
-        f"Interval: {app.bot_data.get('interval', INTERVAL)} seconds\n"
-    )
+    state = "⏸ PAUSED" if paused else "🟢 ACTIVE"
+    lines = [
+        "📡 SPEEDTEST MONITOR | STATUS",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"State       {state}",
+        f"Interval    {app.bot_data.get('interval', INTERVAL)} seconds",
+    ]
     if latest:
-        text += (
-            f"\nLast test: {latest['timestamp']}\n"
-            f"Download: {latest['download_mbps']:.2f} Mbps\n"
-            f"Upload: {latest['upload_mbps']:.2f} Mbps\n"
-            f"Ping: {latest['ping_ms']:.2f} ms"
-        )
+        try:
+            dt = datetime.fromisoformat(latest["timestamp"])
+            last_text = dt.strftime("%d %b %Y • %H:%M UTC")
+        except (ValueError, TypeError):
+            last_text = str(latest["timestamp"])
+        lines += ["", "📊 LATEST RESULT",
+                  f"⬇️ Download   {latest['download_mbps']:,.2f} Mbps",
+                  f"⬆️ Upload     {latest['upload_mbps']:,.2f} Mbps",
+                  f"🏓 Latency    {latest['ping_ms']:,.2f} ms",
+                  f"🕒 Tested     {last_text}"]
     else:
-        text += "\nNo saved tests yet."
-    await update.effective_message.reply_text(text)
+        lines += ["", "No test results have been recorded yet."]
+    lines += ["", "━━━━━━━━━━━━━━━━━━━━"]
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -404,18 +457,20 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (
-        "📊 SPEEDTEST STATISTICS\n\n"
-        f"Tests recorded: {row['count']}\n"
-        f"Last test: {row['last_test']}\n\n"
-        "⬇️ DOWNLOAD (Mbps)\n"
-        f"Average: {fmt(row['avg_down'])}\n"
-        f"Minimum: {fmt(row['min_down'])}\n"
-        f"Maximum: {fmt(row['max_down'])}\n\n"
-        "⬆️ UPLOAD (Mbps)\n"
-        f"Average: {fmt(row['avg_up'])}\n"
-        f"Minimum: {fmt(row['min_up'])}\n"
-        f"Maximum: {fmt(row['max_up'])}\n\n"
-        f"Average ping: {fmt(row['avg_ping'])} ms"
+        "📊 SPEEDTEST | PERFORMANCE OVERVIEW\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Tests recorded  {row['count']}\n"
+        f"Last test      {row['last_test']}\n\n"
+        "⬇️ DOWNLOAD SPEED\n"
+        f"  Average  {fmt(row['avg_down'])} Mbps\n"
+        f"  Minimum  {fmt(row['min_down'])} Mbps\n"
+        f"  Maximum  {fmt(row['max_down'])} Mbps\n\n"
+        "⬆️ UPLOAD SPEED\n"
+        f"  Average  {fmt(row['avg_up'])} Mbps\n"
+        f"  Minimum  {fmt(row['min_up'])} Mbps\n"
+        f"  Maximum  {fmt(row['max_up'])} Mbps\n\n"
+        f"🏓 Average latency  {fmt(row['avg_ping'])} ms\n"
+        "━━━━━━━━━━━━━━━━━━━━"
     )
     await update.effective_message.reply_text(text)
 
@@ -426,13 +481,13 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("No history available yet.")
         return
 
-    lines = [f"🧾 LAST {len(rows)} SPEED TESTS", ""]
+    lines = ["🧾 SPEEDTEST | RECENT HISTORY", "━━━━━━━━━━━━━━━━━━━━", f"Showing the latest {len(rows)} test(s)", ""]
     for row in rows:
         lines.append(
             f"🕒 {row['timestamp']}\n"
-            f"⬇️ {row['download_mbps']:.2f} Mbps | "
-            f"⬆️ {row['upload_mbps']:.2f} Mbps | "
-            f"🏓 {row['ping_ms']:.2f} ms"
+            f"⬇️ {row['download_mbps']:,.2f} Mbps   "
+            f"⬆️ {row['upload_mbps']:,.2f} Mbps\n"
+            f"🏓 Latency: {row['ping_ms']:,.2f} ms"
         )
     # Telegram message limit is 4096 characters.
     text = "\n\n".join(lines)
@@ -518,9 +573,12 @@ async def post_init(application: Application):
         await application.bot.send_message(
             chat_id=GROUP_ID,
             text=(
-                "🚀 Speedtest Bot started successfully!\n"
-                f"Automatic interval: {INTERVAL} seconds\n"
-                "Use /help to see commands."
+                "🚀 SPEEDTEST MONITOR IS ONLINE\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "🟢 Status: Operational\n"
+                f"⏱ Auto-test interval: {INTERVAL} seconds\n\n"
+                "Use /help to explore reports and controls.\n"
+                "━━━━━━━━━━━━━━━━━━━━"
             ),
         )
     except TelegramError:
