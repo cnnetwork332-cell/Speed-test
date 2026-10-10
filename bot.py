@@ -1,158 +1,563 @@
-import os
+from pathlib import Path
+
+code = r'''import os
 import asyncio
 import logging
-import speedtest
+import sqlite3
+import statistics
+from datetime import datetime, timezone
+from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
 
-from telegram import Bot
-from telegram.request import HTTPXRequest
+import speedtest
+from telegram import Update
+from telegram.constants import ChatType
+from telegram.error import TelegramError, RetryAfter
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+# ========================= CONFIGURATION =========================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GROUP_ID_RAW = os.getenv("GROUP_ID", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("Please set BOT_TOKEN environment variable.")
+if not GROUP_ID_RAW:
+    raise RuntimeError("Please set GROUP_ID environment variable.")
+
+GROUP_ID = int(GROUP_ID_RAW)
+INTERVAL = max(60, int(os.getenv("INTERVAL", "1800")))  # seconds; minimum 60
+MIN_DOWNLOAD_MBPS = float(os.getenv("MIN_DOWNLOAD_MBPS", "0"))
+MIN_UPLOAD_MBPS = float(os.getenv("MIN_UPLOAD_MBPS", "0"))
+ALERT_ON_FAILURE = os.getenv("ALERT_ON_FAILURE", "true").lower() == "true"
+SHOW_CLIENT_IP = os.getenv("SHOW_CLIENT_IP", "false").lower() == "true"
+SHOW_COORDINATES = os.getenv("SHOW_COORDINATES", "false").lower() == "true"
+DB_PATH = os.getenv("DB_PATH", "speedtests.sqlite3")
+HISTORY_LIMIT = max(1, min(20, int(os.getenv("HISTORY_LIMIT", "10"))))
+
+# Comma-separated Telegram user IDs. If empty, commands are not restricted.
+# Set ADMIN_IDS to secure monitor controls, e.g. "123456789,987654321".
+ADMIN_IDS = {
+    int(value.strip())
+    for value in os.getenv("ADMIN_IDS", "").split(",")
+    if value.strip().isdigit()
+}
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
+log = logging.getLogger("speedtest-bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_ID = int(os.getenv("GROUP_ID"))
-INTERVAL = int(os.getenv("INTERVAL", "3"))
-
-request = HTTPXRequest(
-    connect_timeout=30,
-    read_timeout=60,
-    write_timeout=60,
-    pool_timeout=60
-)
-
-bot = Bot(
-    token=BOT_TOKEN,
-    request=request
-)
+# speedtest-cli is blocking; use one worker and one test at a time.
+executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speedtest")
+test_lock = asyncio.Lock()
 
 
-def mbps(bits):
-    return round(bits / 1000000, 2)
+# ========================= DATABASE ==============================
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def mb(byte):
-    return round(byte / 1024 / 1024, 2)
+def init_db():
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                download_mbps REAL NOT NULL,
+                upload_mbps REAL NOT NULL,
+                ping_ms REAL NOT NULL,
+                bytes_sent_mb REAL NOT NULL,
+                bytes_received_mb REAL NOT NULL,
+                server_name TEXT,
+                server_country TEXT,
+                server_sponsor TEXT,
+                client_ip TEXT,
+                isp TEXT,
+                client_country TEXT,
+                share_url TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tests_timestamp ON tests(timestamp)")
 
 
-def run_speedtest():
+def save_result(result):
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO tests (
+                timestamp, download_mbps, upload_mbps, ping_ms,
+                bytes_sent_mb, bytes_received_mb, server_name,
+                server_country, server_sponsor, client_ip, isp,
+                client_country, share_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            result["timestamp"], result["download_mbps"],
+            result["upload_mbps"], result["ping_ms"],
+            result["bytes_sent_mb"], result["bytes_received_mb"],
+            result["server_name"], result["server_country"],
+            result["server_sponsor"], result["client_ip"],
+            result["isp"], result["client_country"], result["share_url"],
+        ))
+
+
+def read_history(limit=HISTORY_LIMIT):
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT * FROM tests ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+
+def read_stats():
+    with db_connect() as conn:
+        return conn.execute("""
+            SELECT COUNT(*) AS count,
+                   AVG(download_mbps) AS avg_down,
+                   MIN(download_mbps) AS min_down,
+                   MAX(download_mbps) AS max_down,
+                   AVG(upload_mbps) AS avg_up,
+                   MIN(upload_mbps) AS min_up,
+                   MAX(upload_mbps) AS max_up,
+                   AVG(ping_ms) AS avg_ping,
+                   MAX(timestamp) AS last_test
+            FROM tests
+        """).fetchone()
+
+
+def read_latest():
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT * FROM tests ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+
+# ========================= SPEED TEST ============================
+
+def bytes_to_mb(value):
+    return round(value / (1024 * 1024), 2)
+
+
+def run_speedtest_sync():
+    """Blocking function. Always call it through asyncio.to_thread."""
+    st = speedtest.Speedtest()
+    st.get_best_server()
+
+    download_bits = st.download()
+    upload_bits = st.upload()
+    data = st.results.dict()
+
     try:
-        st = speedtest.Speedtest()
+        share_url = st.results.share()
+    except Exception:
+        log.exception("Could not create Speedtest share image")
+        share_url = None
 
-        st.get_best_server()
+    server = data.get("server") or {}
+    client = data.get("client") or {}
 
-        download = st.download()
-        upload = st.upload()
-
-        image = st.results.share()
-
-        data = st.results.dict()
-
-        return {
-            "image": image,
-            "download": mbps(download),
-            "upload": mbps(upload),
-            "ping": round(data["ping"], 3),
-            "timestamp": data["timestamp"],
-            "bytes_sent": mb(data["bytes_sent"]),
-            "bytes_received": mb(data["bytes_received"]),
-            "server": {
-                "name": data["server"]["name"],
-                "country": data["server"]["country"],
-                "sponsor": data["server"]["sponsor"],
-                "lat": data["server"]["lat"],
-                "lon": data["server"]["lon"]
-            },
-            "client": {
-                "ip": data["client"]["ip"],
-                "isp": data["client"]["isp"],
-                "country": data["client"]["country"],
-                "lat": data["client"]["lat"],
-                "lon": data["client"]["lon"]
-            }
-        }
-
-    except Exception as e:
-        logging.exception(e)
-        return None
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "download_mbps": round(download_bits / 1_000_000, 2),
+        "upload_mbps": round(upload_bits / 1_000_000, 2),
+        "ping_ms": round(float(data.get("ping") or 0), 2),
+        "bytes_sent_mb": bytes_to_mb(data.get("bytes_sent", 0)),
+        "bytes_received_mb": bytes_to_mb(data.get("bytes_received", 0)),
+        "server_name": str(server.get("name", "Unknown")),
+        "server_country": str(server.get("country", "Unknown")),
+        "server_sponsor": str(server.get("sponsor", "Unknown")),
+        "server_lat": server.get("lat"),
+        "server_lon": server.get("lon"),
+        "client_ip": str(client.get("ip", "Unknown")),
+        "isp": str(client.get("isp", "Unknown")),
+        "client_country": str(client.get("country", "Unknown")),
+        "client_lat": client.get("lat"),
+        "client_lon": client.get("lon"),
+        "share_url": share_url,
+    }
 
 
-async def send():
+# ========================= FORMATTING ============================
 
-    result = run_speedtest()
+def fmt(value, digits=2):
+    return "N/A" if value is None else f"{value:.{digits}f}"
 
-    if result is None:
+
+def format_result(r, include_alert=True):
+    # Use UTC explicitly so the timestamp is unambiguous.
+    try:
+        dt = datetime.fromisoformat(r["timestamp"])
+        time_text = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, TypeError):
+        time_text = str(r["timestamp"])
+
+    lines = [
+        "🚀 SPEEDTEST REPORT",
+        "",
+        f"⬇️ Download: {r['download_mbps']:.2f} Mbps",
+        f"⬆️ Upload: {r['upload_mbps']:.2f} Mbps",
+        f"🏓 Ping: {r['ping_ms']:.2f} ms",
+        f"🕒 Time: {time_text}",
+        f"📤 Test data sent: {r['bytes_sent_mb']:.2f} MB",
+        f"📥 Test data received: {r['bytes_received_mb']:.2f} MB",
+        "",
+        "🌐 SERVER",
+        f"Name: {r['server_name']}",
+        f"Country: {r['server_country']}",
+        f"Sponsor: {r['server_sponsor']}",
+        "",
+        "👤 CONNECTION",
+        f"ISP: {r['isp']}",
+        f"Country: {r['client_country']}",
+    ]
+
+    if SHOW_CLIENT_IP:
+        lines.append(f"IP: {r['client_ip']}")
+
+    if SHOW_COORDINATES:
+        lines += [
+            f"Server coordinates: {r.get('server_lat')}, {r.get('server_lon')}",
+            f"Client coordinates: {r.get('client_lat')}, {r.get('client_lon')}",
+        ]
+
+    if include_alert:
+        alerts = []
+        if MIN_DOWNLOAD_MBPS > 0 and r["download_mbps"] < MIN_DOWNLOAD_MBPS:
+            alerts.append(f"⚠️ Download below {MIN_DOWNLOAD_MBPS:g} Mbps threshold")
+        if MIN_UPLOAD_MBPS > 0 and r["upload_mbps"] < MIN_UPLOAD_MBPS:
+            alerts.append(f"⚠️ Upload below {MIN_UPLOAD_MBPS:g} Mbps threshold")
+        if alerts:
+            lines += ["", *alerts]
+
+    lines += ["", "Powered by Speedtest Bot"]
+    return "\n".join(lines)
+
+
+async def safe_send(context, chat_id, text):
+    """Send a message with basic Telegram flood-control handling."""
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            disable_web_page_preview=True,
+        )
+    except RetryAfter as exc:
+        delay = getattr(exc, "retry_after", 5)
+        if hasattr(delay, "total_seconds"):
+            delay = delay.total_seconds()
+        await asyncio.sleep(float(delay) + 1)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text, disable_web_page_preview=True
+            )
+        except TelegramError:
+            log.exception("Telegram send failed after retry")
+    except TelegramError:
+        log.exception("Telegram send failed")
+
+
+async def post_result(context, result):
+    caption = format_result(result)
+    share_url = result.get("share_url")
+
+    # speedtest-cli's share image is hosted externally and may be unavailable.
+    # If it fails to send, fall back to a text report.
+    if share_url:
+        try:
+            await context.bot.send_photo(
+                chat_id=GROUP_ID,
+                photo=share_url,
+                caption=caption[:1024],
+            )
+            return
+        except TelegramError:
+            log.warning("Share image failed to send; falling back to text")
+
+    await safe_send(context, GROUP_ID, caption)
+
+
+# ========================= ACCESS CONTROL ========================
+
+def admin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if ADMIN_IDS and (user is None or user.id not in ADMIN_IDS):
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    "⛔ You are not authorized to use this command."
+                )
+            return
+        return await func(update, context)
+    return wrapper
+
+
+# ========================= CORE OPERATIONS ======================
+
+async def perform_test(context, notify_group=True):
+    # Prevent manual commands and scheduled monitoring from overlapping.
+    if test_lock.locked():
+        return None, "A speed test is already running. Please try again shortly."
+
+    async with test_lock:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(executor, run_speedtest_sync)
+        await asyncio.to_thread(save_result, result)
+
+    if notify_group:
+        await post_result(context, result)
+    return result, None
+
+
+async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    if context.application.bot_data.get("monitor_paused", False):
         return
 
-    s = result["server"]
-    c = result["client"]
+    try:
+        result, error = await perform_test(context, notify_group=True)
+        if error:
+            log.info(error)
+            return
+        log.info(
+            "Test saved: download=%.2f Mbps upload=%.2f Mbps ping=%.2f ms",
+            result["download_mbps"], result["upload_mbps"], result["ping_ms"],
+        )
+    except Exception:
+        log.exception("Scheduled speed test failed")
+        if ALERT_ON_FAILURE:
+            await safe_send(context, GROUP_ID, "❌ Scheduled speed test failed. Check the bot logs.")
 
-    caption = f"""╭─《 🚀 SPEEDTEST INFO 》
-├ Upload: {result['upload']} MB/s
-├ Download: {result['download']} MB/s
-├ Ping: {result['ping']} ms
-├ Time: {result['timestamp']}
-├ Data Sent: {result['bytes_sent']} MB
-╰ Data Received: {result['bytes_received']} MB
 
-╭─《 🌐 SPEEDTEST SERVER 》
-├ Name: {s['name']}
-├ Country: {s['country']}
-├ Sponsor: {s['sponsor']}
-├ Latency: {result['ping']} ms
-├ Latitude: {s['lat']}
-╰ Longitude: {s['lon']}
+# ========================= COMMANDS ==============================
 
-╭─《 👤 CLIENT DETAILS 》
-├ IP Address: {c['ip']}
-├ Latitude: {c['lat']}
-├ Longitude: {c['lon']}
-├ Country: {c['country']}
-├ ISP: {c['isp']}
-├ ISP Rating: N/A
-╰ Powered by कार्तिक
-"""
-
-    await bot.send_photo(
-        chat_id=GROUP_ID,
-        photo=result["image"],
-        caption=caption
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "🚀 Speedtest Bot is online!\n\n"
+        "Commands:\n"
+        "/speedtest - Run a test now\n"
+        "/status - Monitoring status and latest result\n"
+        "/stats - Historical statistics\n"
+        "/history - Recent tests\n"
+        "/monitor_on - Resume automatic tests\n"
+        "/monitor_off - Pause automatic tests\n"
+        "/setinterval 1800 - Change interval in seconds\n"
+        "/help - Show commands\n\n"
+        "Speed units: Mbps. Test interval is at least 60 seconds."
     )
 
 
-async def monitor():
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+
+@admin_only
+async def speedtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.effective_message.reply_text(
+        "⏳ Running speed test. This can take a little while..."
+    )
     try:
-        await bot.send_message(
-            chat_id=GROUP_ID,
-            text="🚀 Speedtest Bot Started Successfully!"
+        result, error = await perform_test(context, notify_group=False)
+        if error:
+            await msg.edit_text(f"⚠️ {error}")
+            return
+        await msg.edit_text(format_result(result))
+        # Also publish the result in the configured group if command was elsewhere.
+        if update.effective_chat and update.effective_chat.id != GROUP_ID:
+            await post_result(context, result)
+        elif update.effective_chat and update.effective_chat.id == GROUP_ID:
+            # The result is already visible in the command chat.
+            pass
+    except Exception as exc:
+        log.exception("Manual speed test failed")
+        await msg.edit_text(f"❌ Speed test failed: {str(exc)[:500]}")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    paused = app.bot_data.get("monitor_paused", False)
+    latest = await asyncio.to_thread(read_latest)
+    state = "⏸ Paused" if paused else "🟢 Running"
+    text = (
+        f"📡 MONITOR STATUS\n"
+        f"Automatic monitoring: {state}\n"
+        f"Interval: {app.bot_data.get('interval', INTERVAL)} seconds\n"
+    )
+    if latest:
+        text += (
+            f"\nLast test: {latest['timestamp']}\n"
+            f"Download: {latest['download_mbps']:.2f} Mbps\n"
+            f"Upload: {latest['upload_mbps']:.2f} Mbps\n"
+            f"Ping: {latest['ping_ms']:.2f} ms"
         )
-    except Exception as e:
-        logging.error(f"Startup message failed: {e}")
-
-    while True:
-        try:
-            await send()
-            logging.info("✅ Speedtest sent successfully")
-
-        except Exception as e:
-            logging.exception(f"Speedtest Error: {e}")
-
-            try:
-                await bot.send_message(
-                    chat_id=GROUP_ID,
-                    text=f"❌ Speedtest Failed!\n\nReason:\n{e}"
-                )
-            except Exception:
-                pass
-
-        await asyncio.sleep(INTERVAL)
+    else:
+        text += "\nNo saved tests yet."
+    await update.effective_message.reply_text(text)
 
 
-async def main():
-    logging.info("🚀 Bot Started")
-    await monitor()
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = await asyncio.to_thread(read_stats)
+    if not row or row["count"] == 0:
+        await update.effective_message.reply_text("No speed tests recorded yet.")
+        return
+
+    text = (
+        "📊 SPEEDTEST STATISTICS\n\n"
+        f"Tests recorded: {row['count']}\n"
+        f"Last test: {row['last_test']}\n\n"
+        "⬇️ DOWNLOAD (Mbps)\n"
+        f"Average: {fmt(row['avg_down'])}\n"
+        f"Minimum: {fmt(row['min_down'])}\n"
+        f"Maximum: {fmt(row['max_down'])}\n\n"
+        "⬆️ UPLOAD (Mbps)\n"
+        f"Average: {fmt(row['avg_up'])}\n"
+        f"Minimum: {fmt(row['min_up'])}\n"
+        f"Maximum: {fmt(row['max_up'])}\n\n"
+        f"Average ping: {fmt(row['avg_ping'])} ms"
+    )
+    await update.effective_message.reply_text(text)
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = await asyncio.to_thread(read_history, HISTORY_LIMIT)
+    if not rows:
+        await update.effective_message.reply_text("No history available yet.")
+        return
+
+    lines = [f"🧾 LAST {len(rows)} SPEED TESTS", ""]
+    for row in rows:
+        lines.append(
+            f"🕒 {row['timestamp']}\n"
+            f"⬇️ {row['download_mbps']:.2f} Mbps | "
+            f"⬆️ {row['upload_mbps']:.2f} Mbps | "
+            f"🏓 {row['ping_ms']:.2f} ms"
+        )
+    # Telegram message limit is 4096 characters.
+    text = "\n\n".join(lines)
+    await update.effective_message.reply_text(text[:4000])
+
+
+@admin_only
+async def monitor_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["monitor_paused"] = True
+    await update.effective_message.reply_text("⏸ Automatic speed tests paused.")
+
+
+@admin_only
+async def monitor_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["monitor_paused"] = False
+    await update.effective_message.reply_text("🟢 Automatic speed tests resumed.")
+
+
+@admin_only
+async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text(
+            f"Current interval: {context.application.bot_data.get('interval', INTERVAL)} seconds.\n"
+            "Usage: /setinterval 1800 (minimum 60 seconds)"
+        )
+        return
+
+    try:
+        seconds = int(context.args[0])
+        if seconds < 60 or seconds > 604800:
+            raise ValueError
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ Enter a whole number from 60 to 604800 seconds."
+        )
+        return
+
+    context.application.bot_data["interval"] = seconds
+    job = context.application.bot_data.get("monitor_job")
+    if job:
+        job.schedule_removal()
+
+    new_job = context.application.job_queue.run_repeating(
+        monitor_job, interval=seconds, first=seconds, name="speedtest-monitor"
+    )
+    context.application.bot_data["monitor_job"] = new_job
+    await update.effective_message.reply_text(
+        f"✅ Monitoring interval changed to {seconds} seconds.\n"
+        "This setting lasts until the bot restarts; set INTERVAL in the environment to persist it."
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error(
+        "Unhandled Telegram handler error",
+        exc_info=(type(context.error), context.error, context.error.__traceback__)
+        if context.error else None,
+    )
+
+
+# ========================= LIFECYCLE =============================
+
+async def post_init(application: Application):
+    await asyncio.to_thread(init_db)
+    application.bot_data["monitor_paused"] = False
+    application.bot_data["interval"] = INTERVAL
+
+    job_queue = application.job_queue
+    if job_queue is None:
+        raise RuntimeError(
+            'JobQueue unavailable. Install with: pip install "python-telegram-bot[job-queue]>=21,<23"'
+        )
+
+    job = job_queue.run_repeating(
+        monitor_job,
+        interval=INTERVAL,
+        first=10,
+        name="speedtest-monitor",
+    )
+    application.bot_data["monitor_job"] = job
+
+    try:
+        await application.bot.send_message(
+            chat_id=GROUP_ID,
+            text=(
+                "🚀 Speedtest Bot started successfully!\n"
+                f"Automatic interval: {INTERVAL} seconds\n"
+                "Use /help to see commands."
+            ),
+        )
+    except TelegramError:
+        log.exception("Could not send startup message; check GROUP_ID and bot permissions")
+
+
+def main():
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("speedtest", speedtest_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("monitor_off", monitor_off))
+    application.add_handler(CommandHandler("monitor_on", monitor_on))
+    application.add_handler(CommandHandler("setinterval", set_interval))
+    application.add_error_handler(error_handler)
+
+    log.info("Starting Speedtest Bot")
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
+'''
+path = Path("/mnt/data/bot.py")
+path.write_text(code, encoding="utf-8")
+print(f"Created {path} ({len(code.splitlines())} lines)")
