@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue]==20.6
+python-telegram-bot[job-queue]>=20.6,<23
 speedtest-cli==2.1.3
