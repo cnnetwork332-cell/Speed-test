@@ -1,4 +1,3 @@
-```python
 import os
 import html
 import asyncio
@@ -443,4 +442,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
